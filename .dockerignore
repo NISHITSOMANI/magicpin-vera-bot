@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+.env
+.git/
+expanded/
+results/
+dataset/
+examples/
+tests/
+*.md
+*.jsonl
+generate_submission.py
+judge_simulator.py
+.pytest_cache/
+.DS_Store
