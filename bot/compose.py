@@ -11,8 +11,10 @@ from .decision.strategies import for_trigger, Strategy
 from .decision.voice import voice_for, language_for
 from .decision.facts import top_anchor_facts, numeric_anchors, named_entities, collect_strings
 from .composer.prompts import SYSTEM_BASE, build_user_prompt
-from .composer.llm import call_llm
-from .composer.guard import parse_json_loose, check_groundedness, voice_violations, normalize
+from .composer.llm import call_llm, record_provider_use
+from .composer.guard import parse_json_loose, check_groundedness, check_groundedness_v2, voice_violations, normalize
+from .composer.few_shots import pick_few_shots
+from .composer.critic import critique_and_revise
 from .composer import templates as templates_mod
 from .store import COMPOSE_CACHE
 
@@ -44,9 +46,20 @@ def _truncate(s: str, n: int) -> str:
     return (cut[:sp] if sp > n * 0.6 else cut).rstrip() + "…"
 
 
+def _grounding_check(body: str, contexts: dict, allowed_nums: set[str], name_pool: set[str]) -> tuple[bool, list[str], list[str]]:
+    try:
+        grounded, unsourced, _traced = check_groundedness_v2(body, contexts)
+        warnings = [f"{claim.kind}:{claim.text}" for claim in unsourced]
+        return grounded, warnings, warnings
+    except Exception:
+        grounded, violations = check_groundedness(body, allowed_nums, name_pool)
+        return grounded, violations, violations
+
+
 def compose(category: dict | None, merchant: dict | None, trigger: dict | None,
             customer: dict | None = None, *, deadline_seconds: float = 22.0) -> dict:
     """Compose a message. Returns dict with body, cta, send_as, suppression_key, rationale, meta."""
+    start = time.time()
     ck = _cache_key(category, merchant, trigger, customer)
     if ck in COMPOSE_CACHE:
         return COMPOSE_CACHE[ck]
@@ -71,11 +84,20 @@ def compose(category: dict | None, merchant: dict | None, trigger: dict | None,
     body = ""
     cta = "binary_yes"
     rationale_parts: list[str] = []
+    critic_scores: dict | None = None
+    grounding_warnings: list[str] = []
+    contexts = {"category": category, "merchant": merchant, "trigger": trigger, "customer": customer}
 
     # --- LLM attempt with guard ---
     try:
         sys = SYSTEM_BASE
-        usr = build_user_prompt(category, merchant, trigger, customer, strategy)
+        few_shots = pick_few_shots(
+            (category or {}).get("slug", ""),
+            (trigger or {}).get("kind", strategy.kind),
+            strategy.send_as,
+            k=2,
+        )
+        usr = build_user_prompt(category, merchant, trigger, customer, strategy, few_shots=few_shots)
         text, provider_used = call_llm(sys, usr, deadline_seconds=deadline_seconds)
         parsed = parse_json_loose(text) or {}
         cand_body = normalize(str(parsed.get("body", "") or ""))
@@ -83,7 +105,8 @@ def compose(category: dict | None, merchant: dict | None, trigger: dict | None,
         cand_rationale = str(parsed.get("rationale", "") or "").strip()
 
         if cand_body and cand_cta in VALID_CTAS:
-            grounded, violations = check_groundedness(cand_body, allowed_nums, name_pool)
+            grounded, violations, warnings = _grounding_check(cand_body, contexts, allowed_nums, name_pool)
+            grounding_warnings.extend(warnings)
             tabu_hits = voice_violations(cand_body, taboo)
             if grounded and not tabu_hits:
                 body = _truncate(cand_body, strategy.max_chars)
@@ -92,14 +115,15 @@ def compose(category: dict | None, merchant: dict | None, trigger: dict | None,
             else:
                 # Single repair pass — strip flagged items by asking model to re-anchor strictly
                 repair_sys = SYSTEM_BASE + "\n\nPREVIOUS DRAFT FAILED GROUNDING. You may ONLY use facts that appear in CONTEXT. Remove any number, name, or claim not in CONTEXT."
-                repair_usr = usr + f"\n\nPREVIOUS_DRAFT_BODY: {cand_body}\nVIOLATIONS: numbers={[v for v in violations if v.startswith('unknown_number')]}; names={[v for v in violations if v.startswith('unknown_name')]}; taboo={tabu_hits}\nReturn the corrected JSON only."
+                repair_usr = usr + f"\n\nPREVIOUS_DRAFT_BODY: {cand_body}\nVIOLATIONS: {violations}; taboo={tabu_hits}\nReturn the corrected JSON only."
                 try:
                     text2, provider_used2 = call_llm(repair_sys, repair_usr, deadline_seconds=max(6.0, deadline_seconds / 2))
                     p2 = parse_json_loose(text2) or {}
                     b2 = normalize(str(p2.get("body", "") or ""))
                     c2 = str(p2.get("cta", "") or "").strip()
                     if b2 and c2 in VALID_CTAS:
-                        ok2, _ = check_groundedness(b2, allowed_nums, name_pool)
+                        ok2, _viol2, warnings2 = _grounding_check(b2, contexts, allowed_nums, name_pool)
+                        grounding_warnings.extend(warnings2)
                         tab2 = voice_violations(b2, taboo)
                         if ok2 and not tab2:
                             body = _truncate(b2, strategy.max_chars)
@@ -111,9 +135,32 @@ def compose(category: dict | None, merchant: dict | None, trigger: dict | None,
     except Exception as e:
         rationale_parts.append(f"llm_error:{type(e).__name__}")
 
+    # --- Critic pass: improve weak-but-grounded LLM drafts while time remains ---
+    remaining_deadline = deadline_seconds - (time.time() - start)
+    if body and remaining_deadline >= 6.0:
+        try:
+            revised_body, revised_cta, scores = critique_and_revise(
+                body,
+                cta,
+                category,
+                merchant,
+                trigger,
+                customer,
+                strategy,
+                deadline_seconds=remaining_deadline,
+            )
+            critic_scores = scores
+            if revised_body != body:
+                body = _truncate(revised_body, strategy.max_chars)
+                cta = revised_cta
+                rationale_parts.append(f"Critic revised weak draft; scores={scores}.")
+        except Exception as e:
+            rationale_parts.append(f"critic_skipped:{type(e).__name__}")
+
     # --- Template fallback ---
     if not body:
         fallback_used = True
+        record_provider_use("template")
         body, cta = templates_mod.render(category, merchant, trigger, customer)
         body = _truncate(body, strategy.max_chars)
         rationale_parts.append(f"Template fallback for trigger={strategy.kind} (LLM unavailable or ungrounded).")
@@ -136,7 +183,8 @@ def compose(category: dict | None, merchant: dict | None, trigger: dict | None,
         f"{perf_anchor}; "
         f"provider={provider_used}{'+template' if fallback_used else ''}."
     )
-    rationale = (rationale_parts[0] if rationale_parts else "") + " | " + trace
+    rationale_head = " ; ".join(part for part in rationale_parts[:3] if part)
+    rationale = rationale_head + " | " + trace
 
     result = {
         "body": body,
@@ -150,6 +198,8 @@ def compose(category: dict | None, merchant: dict | None, trigger: dict | None,
             "language": lang,
             "provider": provider_used,
             "fallback_used": fallback_used,
+            "critic_scores": critic_scores,
+            "grounding_warnings": grounding_warnings,
         },
     }
     COMPOSE_CACHE[ck] = result

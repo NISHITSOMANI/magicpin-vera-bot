@@ -1,6 +1,7 @@
 """Prompt builders for the composer. Strict, grounded, deterministic."""
 from __future__ import annotations
 import json
+from typing import Any
 from ..decision.strategies import Strategy
 from ..decision.voice import voice_for, language_for
 from ..decision.facts import top_anchor_facts
@@ -25,8 +26,36 @@ OUTPUT FORMAT (strict JSON):
 """
 
 
+def _dump_context(obj: Any, max_chars: int) -> str:
+    text = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 24].rstrip() + "...<context_truncated>"
+
+
+def _few_shot_block(few_shots: list[dict] | None) -> list[str]:
+    if not few_shots:
+        return []
+    lines = ["", "FEW-SHOT EXAMPLES (style only; do not copy facts unless present in CONTEXT):"]
+    for idx, shot in enumerate(few_shots, start=1):
+        output = {
+            "body": shot.get("body", ""),
+            "cta": shot.get("cta", "binary_yes"),
+            "rationale": shot.get("rationale", ""),
+        }
+        lines.extend(
+            [
+                f"--- EXAMPLE {idx} ({shot.get('category')}/{shot.get('trigger_kind')}, send_as={shot.get('send_as')}) ---",
+                "LEVERS USED: " + ", ".join(str(x) for x in (shot.get("levers") or [])),
+                "OUTPUT: " + json.dumps(output, ensure_ascii=False, sort_keys=True, default=str),
+            ]
+        )
+    return lines
+
+
 def build_user_prompt(category: dict | None, merchant: dict | None, trigger: dict | None,
-                     customer: dict | None, strategy: Strategy) -> str:
+                     customer: dict | None, strategy: Strategy,
+                     few_shots: list[dict] | None = None) -> str:
     voice = voice_for(category)
     lang = language_for(merchant, customer)
     anchors = top_anchor_facts(merchant, trigger, category, customer, k=10)
@@ -73,17 +102,18 @@ def build_user_prompt(category: dict | None, merchant: dict | None, trigger: dic
         *[f"  - {a}" for a in anchors],
         "",
         "CONTEXT.category:",
-        json.dumps(cat_min, ensure_ascii=False, sort_keys=True, default=str),
+        _dump_context(cat_min, 3200),
         "",
         "CONTEXT.merchant:",
-        json.dumps(merch_min, ensure_ascii=False, sort_keys=True, default=str),
+        _dump_context(merch_min, 3600),
         "",
         "CONTEXT.trigger:",
-        json.dumps(trig_min, ensure_ascii=False, sort_keys=True, default=str),
+        _dump_context(trig_min, 2400),
     ]
     if cust_min:
-        parts += ["", "CONTEXT.customer:", json.dumps(cust_min, ensure_ascii=False, sort_keys=True, default=str)]
+        parts += ["", "CONTEXT.customer:", _dump_context(cust_min, 2200)]
 
+    parts += _few_shot_block(few_shots)
     parts += [
         "",
         "TASK: Compose the next WhatsApp message under STRATEGY. Output ONLY the JSON object specified by the system rules.",

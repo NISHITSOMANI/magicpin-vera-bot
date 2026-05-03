@@ -74,10 +74,17 @@ The same `compose()` is the pure function used by `/v1/tick`, `/v1/reply` follow
 
 ```
 GET  /v1/healthz        liveness + contexts_loaded counts
+GET  /v1/diagnostics    redacted runtime counters + provider/cache/conversation state
 GET  /v1/metadata       team identity + approach
 POST /v1/context        idempotent (scope, context_id, version) push
 POST /v1/tick           proactive composer; returns up to 20 actions per tick
 POST /v1/reply          stateful FSM-driven response (send | wait | end)
+```
+
+Diagnostics quick check:
+
+```bash
+curl -s http://localhost:8080/v1/diagnostics | python -m json.tool
 ```
 
 ## Run locally

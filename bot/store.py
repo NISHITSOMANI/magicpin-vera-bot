@@ -89,6 +89,12 @@ class ConversationStore:
         with self._lock:
             self._data[conv.conversation_id] = conv
 
+    def stats(self) -> dict[str, int]:
+        with self._lock:
+            closed = sum(1 for conv in self._data.values() if conv.state == "closed")
+            total = len(self._data)
+        return {"total": total, "active": total - closed, "closed": closed}
+
 
 # Singleton
 CONTEXT = ContextStore()

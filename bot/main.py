@@ -1,8 +1,11 @@
 """FastAPI app — 5 endpoints required by the magicpin judge harness."""
 from __future__ import annotations
+import asyncio
+import logging
 import os, time, uuid
 from datetime import datetime
 from typing import Any
+import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -14,11 +17,12 @@ try:
 except Exception:
     pass
 
-from .store import CONTEXT, CONVOS, ConversationTurn
+from .store import CONTEXT, CONVOS, COMPOSE_CACHE, MERCHANT_AUTO_STRIKES, SENT_SUPPRESSION_KEYS, ConversationTurn
 from .compose import compose
 from .reply import respond
 from .decision.router import select_actionable
 from .decision.cooldown import mark_sent
+from .composer.llm import PROVIDER_COUNTS
 
 app = FastAPI(title="Vera Bot — magicpin AI Challenge")
 START = time.time()
@@ -26,6 +30,28 @@ START = time.time()
 TEAM_NAME = os.getenv("TEAM_NAME", "Nishit Somani")
 TEAM_EMAIL = os.getenv("TEAM_EMAIL", "somaninishit36@gmail.com")
 TEAM_VERSION = os.getenv("TEAM_VERSION", "1.0.0")
+PORT = os.getenv("PORT", "8080")
+SELF_URL = os.getenv("SELF_URL", f"http://localhost:{PORT}").rstrip("/")
+LOG = logging.getLogger("vera.main")
+LAST_TICK_AT: str | None = None
+LAST_REPLY_AT: str | None = None
+MESSAGES_SENT = 0
+
+
+async def _warmup_loop() -> None:
+    await asyncio.sleep(10)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                await client.get(f"{SELF_URL}/v1/healthz")
+        except Exception as exc:
+            LOG.info("warmup_ping_failed:%s", type(exc).__name__)
+        await asyncio.sleep(240)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    asyncio.create_task(_warmup_loop())
 
 
 # ----------------------- /v1/healthz -----------------------
@@ -34,6 +60,25 @@ async def healthz():
     return {"status": "ok",
             "uptime_seconds": int(time.time() - START),
             "contexts_loaded": CONTEXT.counts()}
+
+
+# ----------------------- /v1/diagnostics -----------------------
+@app.get("/v1/diagnostics")
+async def diagnostics():
+    conv_stats = CONVOS.stats()
+    return {
+        "uptime_seconds": int(time.time() - START),
+        "contexts_loaded": CONTEXT.counts(),
+        "active_conversations": conv_stats["active"],
+        "conversations_closed": conv_stats["closed"],
+        "messages_sent_total": MESSAGES_SENT,
+        "auto_reply_strikes_by_merchant": sum(1 for strikes in MERCHANT_AUTO_STRIKES.values() if strikes > 0),
+        "suppression_keys_used": sum(len(keys) for keys in SENT_SUPPRESSION_KEYS.values()),
+        "providers_seen": dict(PROVIDER_COUNTS),
+        "last_tick_at": LAST_TICK_AT,
+        "last_reply_at": LAST_REPLY_AT,
+        "compose_cache_size": len(COMPOSE_CACHE),
+    }
 
 
 # ----------------------- /v1/metadata -----------------------
@@ -90,7 +135,9 @@ class TickBody(BaseModel):
 
 @app.post("/v1/tick")
 async def tick(body: TickBody):
+    global LAST_TICK_AT, MESSAGES_SENT
     now_iso = body.now
+    LAST_TICK_AT = datetime.utcnow().isoformat() + "Z"
     triggers: list[dict] = []
     for tid in body.available_triggers:
         t = CONTEXT.get("trigger", tid)
@@ -146,6 +193,7 @@ async def tick(body: TickBody):
             "suppression_key": msg.get("suppression_key", ""),
             "rationale": msg["rationale"],
         })
+        MESSAGES_SENT += 1
     return {"actions": actions}
 
 
@@ -162,6 +210,8 @@ class ReplyBody(BaseModel):
 
 @app.post("/v1/reply")
 async def reply(body: ReplyBody):
+    global LAST_REPLY_AT, MESSAGES_SENT
+    LAST_REPLY_AT = datetime.utcnow().isoformat() + "Z"
     conv = CONVOS.get(body.conversation_id)
     if conv is None:
         # Initialize a state for an unknown conversation (judge starting cold)
@@ -182,6 +232,7 @@ async def reply(body: ReplyBody):
         conv.turns.append(ConversationTurn(role="vera" if conv.send_as == "vera" else "merchant_on_behalf",
                                            body=body_out, ts=body.received_at,
                                            cta=out.get("cta")))
+        MESSAGES_SENT += 1
     CONVOS.update(conv)
     return out
 

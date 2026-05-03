@@ -43,7 +43,7 @@ def main():
     import time as _t
     pairs = load_json(EXP / "test_pairs.json")["pairs"]
     out_path = ROOT / "submission.jsonl"
-    with out_path.open("w") as fh:
+    with out_path.open("w", encoding="utf-8") as fh:
         for i, pair in enumerate(pairs):
             if i > 0:
                 _t.sleep(4.5)  # ~13 RPM, safely under Gemini Flash 15 RPM free tier

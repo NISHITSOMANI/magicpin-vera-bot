@@ -10,6 +10,12 @@ OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
 # Deterministic call cache (process-wide)
 _CALL_CACHE: dict[str, str] = {}
+PROVIDER_COUNTS: dict[str, int] = {"gemini": 0, "groq": 0, "openrouter": 0, "template": 0}
+
+
+def record_provider_use(provider: str) -> None:
+    """Increment provider usage counters for diagnostics."""
+    PROVIDER_COUNTS[provider] = PROVIDER_COUNTS.get(provider, 0) + 1
 
 
 def _cache_key(provider: str, model: str, system: str, user: str) -> str:
@@ -121,11 +127,13 @@ def call_llm(system: str, user: str, *, deadline_seconds: float = 22.0) -> tuple
             break
         ck = _cache_key(provider, model, system, user)
         if ck in _CALL_CACHE:
+            record_provider_use(provider)
             return _CALL_CACHE[ck], provider
         try:
             remaining = max(4.0, deadline_seconds - (time.time() - start))
             text = fn(system, user, model=model, timeout=remaining)
             _CALL_CACHE[ck] = text
+            record_provider_use(provider)
             return text, provider
         except httpx.HTTPStatusError as e:
             last_err = e
